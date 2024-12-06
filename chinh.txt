@@ -1,0 +1,250 @@
+#include <WebSocketsClient.h>
+#include <AsyncTCP.h>
+
+#include <Arduino.h>
+#include <WiFi.h>
+
+#include <SoftwareSerial.h>
+#include <ArduinoJson.h>
+
+#define WIFI_SSID "Viettel Telecom"
+#define WIFI_PASSWORD "567tamchin@"
+#define WS_HOST "192.168.1.7"
+#define WS_PORT 8282
+#define WS_URL "/chat/"
+
+String roomName = "room1";
+String username = "esp32";
+
+WebSocketsClient webSocket;
+
+#define MAX_QUEUE_SIZE 10
+String messageQueue[MAX_QUEUE_SIZE];
+int queueHead = 0;
+int queueTail = 0;
+
+#define DEBUG_MODE true
+
+// Thêm các constant cho timing
+#define SENSOR_INTERVAL 3000    // Gửi dữ liệu cảm biến mỗi 3 giây
+#define RECONNECT_INTERVAL 5000 // Thời gian chờ để kết nối lại
+#define HEARTBEAT_INTERVAL 10000 // Heartbeat interval
+
+unsigned long lastSensorTime = 0;
+unsigned long lastReconnectAttempt = 0;
+bool isConnected = false;
+
+void setup() {
+  Serial.begin(115200);
+  connectToWifi();
+  connectToWebSocket();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Kiểm tra WiFi và reconnect nếu cần
+  if (WiFi.status() != WL_CONNECTED) {
+    if (currentMillis - lastReconnectAttempt > RECONNECT_INTERVAL) {
+      connectToWifi();
+      lastReconnectAttempt = currentMillis;
+    }
+  } else {
+    webSocket.loop();
+    
+    // Gửi dữ liệu cảm biến theo interval
+    if (currentMillis - lastSensorTime > SENSOR_INTERVAL) {
+      if (webSocket.isConnected()) {
+        sendSensorData();
+        lastSensorTime = currentMillis;
+      }
+    }
+    
+    processQueue();
+  }
+  // Không cần delay cố định nữa
+}
+
+void connectToWifi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+}
+
+void connectToWebSocket() {
+  String socketUrl = WS_URL;
+  socketUrl += random(0, 999);
+  socketUrl += "/";
+  socketUrl += random(0, 999999);
+  socketUrl += "/websocket";
+  
+  webSocket.begin(WS_HOST, WS_PORT, socketUrl);
+  webSocket.onEvent(webSocketEvent);
+}
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            isConnected = false;
+            debugPrint("WebSocket disconnected");
+            break;
+            
+        case WStype_CONNECTED:
+            isConnected = true;
+            debugPrint("WebSocket connected");
+            break;
+            
+        case WStype_TEXT: {
+            String text = (char*)payload;
+            debugPrint("Received: " + text);
+            
+            if (text.startsWith("h")) {
+                debugPrint("Heartbeat received");
+            } else if (text.startsWith("o")) {
+                String msg = "[\"CONNECT\\naccept-version:1.1,1.0\\nheart-beat:10000,10000\\n\\n\\u0000\"]";
+                webSocket.sendTXT(msg);
+            } else if (text.startsWith("a[\"CONNECTED")) {
+                subscribeToChannel(roomName);
+                sendMessage(roomName, username, username + " connected", "SYSTEM");
+            } else if (text.startsWith("a[\"MESSAGE")) {
+                processJsonData(text);
+            }
+            break;
+        }
+    }
+}
+
+void subscribeToChannel(String channelName) {
+  String msg = "[\"SUBSCRIBE\\nid:sub-0\\ndestination:/topic/messages/" + 
+               channelName + "\\n\\n\\u0000\"]";
+  webSocket.sendTXT(msg);
+}
+
+void sendMessage(String channelName, String username, String messageText, String messageType) {
+  String messageData = "[\"SEND\\ndestination:/app/chat/" +
+                        channelName + "\\n\\n{\\\"username\\\":\\\"" +
+                        username + "\\\",\\\"message\\\":\\\"" +
+                        messageText + "\\\",\\\"messageType\\\":\\\"" +
+                        messageType + "\\\"}\\u0000\"]";
+  webSocket.sendTXT(messageData);
+}
+
+void sendSensorData() {
+  if (!webSocket.isConnected()) {
+    debugPrint("WebSocket not connected, queueing message");
+    return;
+  }
+
+  DynamicJsonDocument jsonDoc(1024);
+  jsonDoc["timestamp"] = millis();
+  
+  JsonObject metrics = jsonDoc.createNestedObject("metrics");
+  metrics["soilHumidity"] = random(30, 70);
+  metrics["lux"] = random(100, 1000);
+  metrics["temperature"] = random(18, 35) + random(0, 10) * 0.1;
+  metrics["co2"] = random(300, 800);
+  metrics["airHumidity"] = random(30, 80);
+  
+  JsonObject devices = jsonDoc.createNestedObject("devices");
+  devices["quatHut"] = random(0, 2);
+  devices["quatThoi"] = random(0, 2);
+  devices["soNongLanh"] = random(0, 2);
+  devices["mayBom"] = random(0, 2);
+  devices["rem"] = random(0, 2);
+
+  String jsonString;
+  serializeJson(jsonDoc, jsonString);
+  
+  sendMessage(roomName, username, jsonString, "SENSOR");
+}
+
+void processJsonData(String _received) {
+    String json = extractString(_received);
+    json.replace("\\", "");
+    Serial.println("Received from server: " + json);  // In ra để debug
+    
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, json);
+    JsonObject obj = doc.as<JsonObject>();
+    
+    String messageType = obj["messageType"];
+    String message = obj["message"];
+    
+    // Xử lý message nhận được
+    if (messageType == "CONTROL") {
+        Serial.println("Got control message: " + message);
+        // Ví dụ nhận lệnh điều khiển từ FE
+        // {"messageType": "CONTROL", "message": "TURN_ON_PUMP"}
+    }
+}
+
+String extractString(String _received) {
+    char startingChar = '{';
+    char finishingChar = '}';
+
+    String tmpData = "";
+    bool _flag = false;
+    for (int i = 0; i < _received.length(); i++) {
+        char tmpChar = _received[i];
+        if (tmpChar == startingChar) {
+            tmpData += startingChar;
+            _flag = true;
+        }
+        else if (tmpChar == finishingChar) {
+            tmpData += finishingChar;
+            break;
+        }
+        else if (_flag == true) {
+            tmpData += tmpChar;
+        }
+    }
+    return tmpData;
+}
+
+void queueMessage(String message) {
+    if ((queueTail + 1) % MAX_QUEUE_SIZE != queueHead) {
+        messageQueue[queueTail] = message;
+        queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
+    }
+}
+
+void processQueue() {
+    if (queueHead != queueTail && webSocket.isConnected()) {
+        webSocket.sendTXT(messageQueue[queueHead]);
+        queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
+    }
+}
+
+void debugPrint(String message) {
+    if (DEBUG_MODE) {
+        Serial.println("[DEBUG] " + message);
+    }
+}
+
+void handleStompFrame(String frame) {
+    if (frame.startsWith("CONNECTED")) {
+        debugPrint("STOMP Connected");
+        // Subscribe sau khi connected
+        subscribeToChannel(roomName);
+    } else if (frame.startsWith("MESSAGE")) {
+        // Parse message header và body
+        int headerEnd = frame.indexOf("\n\n");
+        String headers = frame.substring(0, headerEnd);
+        String body = frame.substring(headerEnd + 2);
+        processMessage(headers, body);
+    }
+}
+
+void processMessage(String headers, String body) {
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, body);
+    
+    String messageType = doc["messageType"];
+    String message = doc["message"];
+    
+    debugPrint("Received message type: " + messageType);
+    // Xử lý message dựa trên type
+}
